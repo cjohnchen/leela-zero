@@ -100,6 +100,7 @@ static_assert(MAX_BATCH == 1, "MAX_BATCH != 1 not implemented");
  * search algorithm.
  */
 //#define USE_TUNER
+#define USE_TUNER
 
 static constexpr auto PROGRAM_NAME = "Leela Zero";
 static constexpr auto PROGRAM_VERSION = "0.16";
