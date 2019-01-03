@@ -16,11 +16,9 @@
     along with Leela Zero.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Enables loading of this file using the C++ pre-processor's #include (C++11 standard raw string
-// literal). Comment-out this line for syntax-highlighting when developing.
+//TODO: __constant define
 
-R"(
-__constant real Bt[WINOGRAD_ALPHA * WINOGRAD_ALPHA] = \
+__device__ real Bt[WINOGRAD_ALPHA * WINOGRAD_ALPHA] = \
                    {1.0f,  0.0f,     -5.0f/2.0f,  0.0f,      1.0f, 0.0f,
                     0.0f, -SQ2,      -2.0f,       SQ2/2.0f,  1.0f, 0.0f,
                     0.0f,  SQ2,      -2.0f,      -SQ2/2.0f,  1.0f, 0.0f,
@@ -28,13 +26,13 @@ __constant real Bt[WINOGRAD_ALPHA * WINOGRAD_ALPHA] = \
                     0.0f,  SQ2/2.0f, -1.0f/2.0f, -SQ2,       1.0f, 0.0f,
                     0.0f,  1.0f,      0.0f,      -5.0f/2.0f, 0.0f, 1.0f};
 
-__constant real At[WINOGRAD_M * WINOGRAD_ALPHA] = \
+__device__ real At[WINOGRAD_M * WINOGRAD_ALPHA] = \
                    {1.0f, 1.0f,      1.0f,       1.0f,      1.0f,     0.0f,
                     0.0f, SQ2/2.0f, -SQ2/2.0f,   SQ2,      -SQ2,      0.0f,
                     0.0f, 1.0f/2.0f, 1.0f/2.0f,  2.0f,      2.0f,     0.0f,
                     0.0f, SQ2/4.0f, -SQ2/4.0f,   2.0f*SQ2, -2.0f*SQ2, 1.0f};
 
-void __in_transform_eq(real x[WINOGRAD_ALPHA][WINOGRAD_ALPHA], __global net_t * restrict V, int offset, int CPpad) {
+__device__ void __in_transform_eq(real x[WINOGRAD_ALPHA][WINOGRAD_ALPHA], __global net_t * restrict V, int offset, int CPpad) {
 
     const int W = BOARD_SIZE;
     const int H = BOARD_SIZE;
@@ -141,7 +139,7 @@ __kernel void in_transform(__global net_t * restrict in, __global net_t * restri
     }
 }
 
-void __out_transform_eq(__global const net_t * restrict M, real o[WINOGRAD_M * WINOGRAD_M],
+__device__ void __out_transform_eq(__global const net_t * restrict M, real o[WINOGRAD_M * WINOGRAD_M],
                         int Kpad, int Ppad, int block)
 {
 
@@ -217,8 +215,8 @@ __kernel void out_transform_fused_bn(__global const net_t * restrict M,
                                      const int Kpad, const int Ppad,
                                      const int batch_size,
                                      __global const net_t * restrict residual,
-                                     __constant const net_t * restrict means,
-                                     __constant const net_t * restrict stddivs) {
+                                     __global __constant net_t * restrict means,
+                                     __global __constant net_t * restrict stddivs) {
 
     const int W = BOARD_SIZE;
     const int H = BOARD_SIZE;
@@ -268,8 +266,7 @@ __kernel void out_transform_fused_bn_in(
                                      const int Kpad, const int Ppad, const int Cpad,
                                      __global const net_t * restrict residual,
                                      __constant const net_t * restrict means,
-                                     __constant const net_t * restrict stddivs,
-                                     __local real * ybuf) {
+                                     __constant const net_t * restrict stddivs) {
 
     const int W = BOARD_SIZE;
     const int H = BOARD_SIZE;
@@ -283,41 +280,89 @@ __kernel void out_transform_fused_bn_in(
     const int block_x = block % WTILES;
     const int block_y = block / WTILES;
 
-    const int yin = WINOGRAD_M * block_y - 1;
-    const int xin = WINOGRAD_M * block_x - 1;
-
     const int x = WINOGRAD_M * block_x;
     const int y = WINOGRAD_M * block_y;
 
-    if (k < K && block < P) {
-        const int kHW = batch * K * NUM_INTERSECTIONS + k * NUM_INTERSECTIONS;
+    const int kHW = batch * K * NUM_INTERSECTIONS + k * NUM_INTERSECTIONS;
 
-        real o[WINOGRAD_M * WINOGRAD_M];
-        __out_transform_eq(M, o, Kpad, Ppad, block + P * batch);
+    __local real ybuf[OUTIN_KWG * NUM_INTERSECTIONS];
+
+    if (k < K && block < P) {
 
         const real mean = vload_net_t(k, means);
         const real scale_stddiv = vload_net_t(k, stddivs);
 
+        real temp_m[WINOGRAD_ALPHA][WINOGRAD_ALPHA];
+        real Atp[WINOGRAD_M * WINOGRAD_ALPHA];
+        real temp[WINOGRAD_ALPHA];
+
+        // M dimensions are [36, outputs, batch_size * tiles].
+        // Plus zero padding from SGEMM.
+
+        const int offset = block * Kpad + k;
+
+        for (int i = 0; i < WINOGRAD_M * WINOGRAD_ALPHA; i++) {
+            Atp[i] = At[i];
+        }
+
+        for (int yn = 0; yn < WINOGRAD_ALPHA; yn++) {
+            for (int xn = 0; xn < WINOGRAD_ALPHA; xn++) {
+                temp_m[xn][yn] = vload_net_t((yn * WINOGRAD_ALPHA + xn) * Kpad * Ppad + offset, M);
+            }
+        }
+
+        // Calculates transpose(A).temp_m.A
         for (int i = 0; i < WINOGRAD_M; i++) {
+            for (int j = 0; j < WINOGRAD_ALPHA; j++) {
+                real acc = ZERO;
+                for (int q = 0; q < WINOGRAD_ALPHA; q++) {
+                    acc += Atp[i * WINOGRAD_ALPHA + q] * temp_m[j][q];
+                }
+                temp[j] = acc;
+            }
+
             for (int j = 0; j < WINOGRAD_M; j++) {
-                const int in_idx = i * WINOGRAD_M + j;
+                real acc = ZERO;
+                for (int q = 0; q < WINOGRAD_ALPHA; q++) {
+                    acc += temp[q] * Atp[j * WINOGRAD_ALPHA + q];
+                }
+
                 const int out_idx = (y + i) * W + (x + j);
+                acc = scale_stddiv * (acc - mean);
                 if (y + i < H && x + j < W) {
-                    o[in_idx] = scale_stddiv * (o[in_idx] - mean);
-                    if (residual) {
-                        o[in_idx] += vload_net_t(kHW + out_idx, residual);
-                    }
-                    o[in_idx] = o[in_idx] > 0 ? o[in_idx] : ZERO;
-                    ybuf[kg * NUM_INTERSECTIONS + out_idx] = o[in_idx];
-                    if (Y) {
-                        vstore_net_t(o[in_idx], kHW + out_idx, Y);
-                    }
+                    ybuf[kg * NUM_INTERSECTIONS + out_idx] = acc;
                 }
             }
         }
     }
 
     barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int ks = get_local_size(0);
+    const int k0 = get_group_id(0) * get_local_size(0);
+
+    for (int x = get_local_id(0) + ks * get_local_id(1); x < ks * NUM_INTERSECTIONS; x += get_local_size(1) * get_local_size(0)) {
+        const int kx = x / NUM_INTERSECTIONS;
+        const int idx = x - kx * NUM_INTERSECTIONS;
+
+        const int kHWx = batch * K * NUM_INTERSECTIONS + (k0 + kx) * NUM_INTERSECTIONS;
+
+        real acc = ybuf[kx * NUM_INTERSECTIONS + idx];
+        if (residual) {
+            acc += vload_net_t(kHWx + idx, residual);
+        }
+        acc = max(acc, ZERO);
+
+        if (Y) {
+            vstore_net_t(acc, kHWx + idx, Y);
+        }
+        ybuf[kx * NUM_INTERSECTIONS + idx] = acc;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int yin = WINOGRAD_M * block_y - 1;
+    const int xin = WINOGRAD_M * block_x - 1;
 
     if (block < P && k < K) {
         const int CPpad = Ppad * Cpad;
@@ -341,5 +386,3 @@ __kernel void out_transform_fused_bn_in(
     }
 }
 
-// End of the C++11 raw string literal
-)"
