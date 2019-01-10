@@ -259,14 +259,11 @@ UCTNode* UCTNode::uct_select_child(int color, bool is_root, int movenum) {
     auto best = static_cast<UCTNodePointer*>(nullptr);
     auto best_value = std::numeric_limits<double>::lowest();
 
-    auto count = 0;
     for (auto& child : m_children) {
         if (!child.active()) {
             continue;
         }
-        
-        if (count > 32 && movenum <= 150) break;
-        
+                
         auto winrate = fpu_eval;
         if (child.is_inflated() && child->m_expand_state.load() == ExpandState::EXPANDING) {
             // Someone else is expanding this node, never select it
@@ -285,7 +282,6 @@ UCTNode* UCTNode::uct_select_child(int color, bool is_root, int movenum) {
             best_value = value;
             best = &child;
         }
-        count++;
     }
 
     assert(best != nullptr);
